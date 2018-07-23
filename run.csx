@@ -53,29 +53,29 @@ private static Mail CreateEmailAlert(List<Alert> allAlerts, TraceWriter log)
     }
     
     var message = new Mail();
-    var content = new Content
+    message.AddContent(new Content
     {
         Type = "text/plain",
         Value = fullAlertString
-    };
-    message.AddContent(content);
+    });
     return message;
-}
-
-private static AzureCredentials GetAzureCredentials()
-{
-    return new AzureCredentialsFactory()
-        .FromMSI(new MSILoginInformation(MSIResourceType.AppService), AzureEnvironment.AzureGlobalCloud);
 }
 
 private static async Task<IEnumerable<CosmosDBAccount>> ListCosmosDBAccountsAsync(TraceWriter log)
 {
     var accountList = new List<CosmosDBAccount>();
 
-    var credentials = GetAzureCredentials();
+    // get the function's credentials from its managed service identity
+    var credentials = new AzureCredentialsFactory()
+        .FromMSI(new MSILoginInformation(MSIResourceType.AppService), AzureEnvironment.AzureGlobalCloud);
 
     // get a list of all subscription IDs accessible to the logged in principal
-    var subscriptionIds = await ListAzureSubscriptionIdsAsync(credentials);
+    var azure = Azure.Configure()
+        .Authenticate(credentials);
+    var subscriptions = await azure
+        .Subscriptions
+        .ListAsync();
+    var subscriptionIds = subscriptions.Select(s => s.SubscriptionId);
             
     // find all Cosmos DB accounts within each subscription
     var tasks = new List<Task<IEnumerable<CosmosDBAccount>>>();
@@ -90,18 +90,6 @@ private static async Task<IEnumerable<CosmosDBAccount>> ListCosmosDBAccountsAsyn
     }
 
     return accountList;
-}
-
-private static async Task<IEnumerable<string>> ListAzureSubscriptionIdsAsync(AzureCredentials credentials)
-{
-    var azureConnection = Azure.Configure()
-        .Authenticate(credentials);
-
-    var subscriptions = await azureConnection
-            .Subscriptions
-            .ListAsync();
-            
-    return subscriptions.Select(s => s.SubscriptionId);
 }
 
 private static async Task<IEnumerable<CosmosDBAccount>> ListCosmosDBAccountsInSubscriptionAsync(string subscriptionId, AzureCredentials credentials, TraceWriter log)
@@ -137,7 +125,7 @@ private static async Task<List<Alert>> CheckCosmosDBAccountAsync(string endpoint
 {
     var alerts = new List<Alert>();
 
-    // connect to Cosmos DB account
+    // connect to the Cosmos DB account
     var client = new DocumentClient(new Uri(endpointUri), authKeyString);
     var account = await client.GetDatabaseAccountAsync();
     log.Verbose($"Scanning Cosmos DB account '{account.Id}'");
@@ -145,7 +133,7 @@ private static async Task<List<Alert>> CheckCosmosDBAccountAsync(string endpoint
     // get a list of databases in the account
     var databases = await client.ReadDatabaseFeedAsync();
 
-    // get a list of offers, which represent the throughput of a collection
+    // get a list of offers, each of which represent the throughput of a collection
     var offers = await client.ReadOffersFeedAsync();
 
     foreach (var database in databases)
@@ -171,10 +159,9 @@ private static async Task<List<Alert>> CheckCosmosDBAccountAsync(string endpoint
             }
             
             // check the throughput against the policy for the collection
-            var alert = CreateAlert(quota, account.Id, database.Id, collection.Id);
+            var alert = CreateAlert(quota, account.Id, database.Id, collection.Id, log);
             if (alert != null)
             {
-                log.Info($"Firing alert for collection '{alert.CollectionId}' in database '{alert.DatabaseId}' in account '{alert.AccountId}'. Expected maximum throughput to be {alert.MaximumQuota}, actual throughput {alert.ActualQuota}.");
                 alerts.Add(alert);
             }
         }
@@ -183,13 +170,15 @@ private static async Task<List<Alert>> CheckCosmosDBAccountAsync(string endpoint
     return alerts;
 }
 
-private static Alert CreateAlert(long quota, string accountId, string databaseId, string collectionId)
+private static Alert CreateAlert(long quota, string accountId, string databaseId, string collectionId, TraceWriter log)
 {
     var maximumQuota = GetMaximumQuotaForCollection(accountId, databaseId, collectionId);
 
     if (quota > maximumQuota)
     {
-        return new Alert()
+        log.Info($"Firing alert for collection '{collectionId}' in database '{databaseId}' in account '{accountId}'. Expected maximum throughput to be {maximumQuota}, actual throughput {quota}.");
+
+        return new Alert
         { 
             ActualQuota = quota,
             MaximumQuota = maximumQuota,
