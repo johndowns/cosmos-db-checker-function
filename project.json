@@ -1,0 +1,11 @@
+{
+  "frameworks": {
+    "net46":{
+      "dependencies": {
+        "Microsoft.Azure.DocumentDB": "1.22.0",
+        "Microsoft.Azure.Management.Fluent": "1.13.0",
+        "Microsoft.Azure.WebJobs.Extensions.SendGrid": "2.2.0"
+      }
+    }
+   }
+}

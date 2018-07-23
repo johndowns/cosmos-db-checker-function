@@ -1,0 +1,20 @@
+{
+  "bindings": [
+    {
+      "name": "myTimer",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "0 0 * */1 * *"
+    },
+    {
+      "name": "$return",
+      "type": "sendGrid",
+      "direction": "out",
+      "apiKey" : "SendGridKey",
+      "to": "%AlertToAddress%",
+      "from": "%AlertFromAddress%",
+      "subject": "Overprovisioned Cosmos DB Collections"
+    }
+  ],
+  "disabled": false
+}
