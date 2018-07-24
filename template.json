@@ -1,0 +1,176 @@
+{
+    "$schema": "http://schema.management.azure.com/schemas/2014-04-01-preview/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "functionsAppServiceName": {
+            "type": "string",
+            "defaultValue": "[concat('cosmoscheck', uniqueString(resourceGroup().id))]",
+            "metadata": {
+                "description": "The name of the Azure Functions application to create. This must be unique."
+            }
+        },
+        "functionSchedule": {
+            "type": "string",
+            "defaultValue": "0 0 * */1 * *",
+            "metadata": {
+                "description": "The schedule on which to run the function. This should be a CRON expression."
+            }
+        },
+        "storageAccountName": {
+            "type": "string",
+            "defaultValue": "[concat('cosmoscheck', uniqueString(resourceGroup().id))]",
+            "metadata": {
+                "description": "The name of the Azure Storage account to store function logs in."
+            }
+        },
+        "storageAccountType": {
+            "type": "string",
+            "defaultValue": "Standard_LRS",
+            "allowedValues": [
+                "Standard_LRS",
+                "Standard_GRS",
+                "Standard_RAGRS",
+                "Standard_ZRS",
+                "Premium_LRS"
+            ],
+            "metadata": {
+                "description": "The account type of the Azure Storage blob account for the Azure Functions app."
+            }
+        },
+        "applicationInsightsLocation": {
+            "type": "string",
+            "defaultValue": "westus2",
+            "metadata": {
+                "description": "The location into which Application Insights should be deployed."
+            }
+        },
+        "sendGridApiKey": {
+            "type": "securestring",
+            "metadata": {
+                "description": "The API key for the SendGrid account to use to send emails."
+            }
+        },
+        "alertFromAddress": {
+            "type": "string",
+            "metadata": {
+                "description": "The email address that Cosmos DB provisioning alerts should be sent from."
+            }
+        },
+        "alertToAddress": {
+            "type": "string",
+            "metadata": {
+                "description": "The email address that Cosmos DB provisioning alerts should be sent to."
+            }
+        }
+    },
+    "variables": {
+        "functionsAppServicePlanName": "CosmosChecker",
+        "applicationInsightsName": "CosmosChecker"
+    },
+    "resources": [
+        {
+            "name": "[variables('functionsAppServicePlanName')]",
+            "type": "Microsoft.Web/serverfarms",
+            "location": "[resourceGroup().location]",
+            "apiVersion": "2016-09-01",
+            "sku": {
+                "name": "Y1",
+                "tier": "Dynamic",
+                "size": "Y1",
+                "family": "Y",
+                "capacity": 0
+            },
+            "kind": "functionapp"
+        },
+        {
+            "name": "[parameters('functionsAppServiceName')]",
+            "type": "Microsoft.Web/sites",
+            "location": "[resourceGroup().location]",
+            "apiVersion": "2016-08-01",
+            "kind": "functionapp",
+            "properties": {
+                "enabled": true,
+                "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('functionsAppServicePlanName'))]",
+                "reserved": false
+            },
+            "identity": {
+                "type": "SystemAssigned"
+            },
+            "resources": [
+                {
+                    "name": "appsettings",
+                    "type": "config",
+                    "apiVersion": "2014-11-01",
+                    "properties": {
+                        "APPINSIGHTS_INSTRUMENTATIONKEY": "[reference(resourceId('Microsoft.Insights/components', variables('applicationInsightsName')), '2014-04-01').InstrumentationKey]",
+                        "AzureWebJobsStorage": "[concat('DefaultEndpointsProtocol=https;AccountName=', parameters('storageAccountName'), ';AccountKey=', listkeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2015-05-01-preview').key1, ';')]",
+                        "AzureWebJobsDashboard": "[concat('DefaultEndpointsProtocol=https;AccountName=', parameters('storageAccountName'), ';AccountKey=', listkeys(resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName')), '2015-05-01-preview').key1, ';')]",
+                        "AlertFromAddress": "[parameters('alertFromAddress')]",
+                        "AlertToAddress": "[parameters('alertToAddress')]",
+                        "SendGridKey": "[parameters('sendGridApiKey')]"
+                    },
+                    "dependsOn": [
+                        "[resourceId('Microsoft.Web/sites', parameters('functionsAppServiceName'))]",
+                        "[resourceId('Microsoft.Insights/components', variables('applicationInsightsName'))]"
+                    ]
+                },
+                {
+                    "name": "ComosChecker",
+                    "type": "functions",
+                    "apiVersion": "2015-08-01",
+                    "properties": {
+                        "config": {
+                            "bindings": [
+                                {
+                                    "name": "myTimer",
+                                    "type": "timerTrigger",
+                                    "direction": "in",
+                                    "schedule": "[parameters('functionSchedule')]"
+                                },
+                                {
+                                    "name": "$return",
+                                    "type": "sendGrid",
+                                    "direction": "out",
+                                    "apiKey": "SendGridKey",
+                                    "to": "%AlertToAddress%",
+                                    "from": "%AlertFromAddress%",
+                                    "subject": "Overprovisioned Cosmos DB Collections"
+                                }
+                            ],
+                            "disabled": false
+                        },
+                        "files": {
+                            "run.csx": "using System;\r\nusing System.Collections.Generic;\r\nusing System.Linq;\r\nusing System.Net;\r\nusing System.Net.Http;\r\nusing System.Threading.Tasks;\r\nusing Microsoft.Azure.Documents;\r\nusing Microsoft.Azure.Documents.Client;\r\nusing Microsoft.Azure.Management.Fluent;\r\nusing Microsoft.Azure.Management.ResourceManager.Fluent;\r\nusing Microsoft.Azure.Management.ResourceManager.Fluent.Authentication;\r\nusing Microsoft.Azure.WebJobs;\r\nusing Microsoft.Azure.WebJobs.Host;\r\nusing Newtonsoft.Json;\r\nusing SendGrid.Helpers.Mail;\r\n\r\nprivate const int DefaultMaximumQuota = 2000;\r\n\r\npublic static async Task<Mail> Run(TimerInfo myTimer, TraceWriter log)\r\n{\r\n    \/\/ list the Cosmos DB accounts available\r\n    var accounts = await ListCosmosDBAccountsAsync(log);\r\n\r\n    \/\/ get the alerts to fire for each Cosmos DB account\r\n    var tasks = new List<Task<List<Alert>>>();\r\n    foreach (var accountDetails in accounts)\r\n    {\r\n        tasks.Add(CheckCosmosDBAccountAsync(accountDetails.EndpointUri, accountDetails.ReadOnlyKey, log));\r\n    }\r\n    await Task.WhenAll(tasks);\r\n    var allAlerts = new List<Alert>();\r\n    foreach (var completedTask in tasks)\r\n    {\r\n        allAlerts.AddRange(completedTask.Result);\r\n    }\r\n\r\n    \/\/ send the alerts, if any\r\n    log.Info($\"Found {allAlerts.Count} alert(s) to fire.\");\r\n    if (! allAlerts.Any())\r\n    {\r\n        return null;\r\n    }\r\n    \r\n    return CreateEmailAlert(allAlerts, log);\r\n}\r\n\r\nprivate static Mail CreateEmailAlert(List<Alert> allAlerts, TraceWriter log)\r\n{\r\n    var fullAlertString = \"The following Cosmos DB collections may be overprovisioned:\\n\";\r\n    foreach (var alert in allAlerts)\r\n    {\r\n        fullAlertString += $\"* {alert.ToString()}\\n\";\r\n    }\r\n    \r\n    var message = new Mail();\r\n    message.AddContent(new Content\r\n    {\r\n        Type = \"text\/plain\",\r\n        Value = fullAlertString\r\n    });\r\n    return message;\r\n}\r\n\r\nprivate static async Task<IEnumerable<CosmosDBAccount>> ListCosmosDBAccountsAsync(TraceWriter log)\r\n{\r\n    var accountList = new List<CosmosDBAccount>();\r\n\r\n    \/\/ get the function's credentials from its managed service identity\r\n    var credentials = new AzureCredentialsFactory()\r\n        .FromMSI(new MSILoginInformation(MSIResourceType.AppService), AzureEnvironment.AzureGlobalCloud);\r\n\r\n    \/\/ get a list of all subscription IDs accessible to the logged in principal\r\n    var azure = Azure.Configure()\r\n        .Authenticate(credentials);\r\n    var subscriptions = await azure\r\n        .Subscriptions\r\n        .ListAsync();\r\n    var subscriptionIds = subscriptions.Select(s => s.SubscriptionId);\r\n            \r\n    \/\/ find all Cosmos DB accounts within each subscription\r\n    var tasks = new List<Task<IEnumerable<CosmosDBAccount>>>();\r\n    foreach (var subscriptionId in subscriptionIds)\r\n    {\r\n        tasks.Add(ListCosmosDBAccountsInSubscriptionAsync(subscriptionId, credentials, log));\r\n    }\r\n    await Task.WhenAll(tasks);\r\n    foreach (var task in tasks)\r\n    {\r\n        accountList.AddRange(task.Result);\r\n    }\r\n\r\n    return accountList;\r\n}\r\n\r\nprivate static async Task<IEnumerable<CosmosDBAccount>> ListCosmosDBAccountsInSubscriptionAsync(string subscriptionId, AzureCredentials credentials, TraceWriter log)\r\n{\r\n    var accountList = new List<CosmosDBAccount>();\r\n\r\n    \/\/ connect to the Azure subscription\r\n    var azure = Azure\r\n            .Configure()\r\n            .Authenticate(credentials)\r\n            .WithSubscription(subscriptionId);\r\n    log.Verbose($\"Checking subscription '{subscriptionId}'\");\r\n            \r\n    \/\/ list all Cosmos DB accounts within the subscription\r\n    var accounts = await azure.CosmosDBAccounts.ListAsync();\r\n    foreach (var account in accounts)\r\n    {\r\n        \/\/ get the account endpoint URI and read-only key\r\n        var endpointUri = account.DocumentEndpoint;\r\n        var authKeys = await account.ListReadOnlyKeysAsync();\r\n\r\n        accountList.Add(new CosmosDBAccount\r\n        {\r\n            EndpointUri = endpointUri,\r\n            ReadOnlyKey = authKeys.PrimaryReadonlyMasterKey\r\n        });\r\n    }\r\n\r\n    return accountList;\r\n}\r\n\r\nprivate static async Task<List<Alert>> CheckCosmosDBAccountAsync(string endpointUri, string authKeyString, TraceWriter log)\r\n{\r\n    var alerts = new List<Alert>();\r\n\r\n    \/\/ connect to the Cosmos DB account\r\n    var client = new DocumentClient(new Uri(endpointUri), authKeyString);\r\n    var account = await client.GetDatabaseAccountAsync();\r\n    log.Verbose($\"Scanning Cosmos DB account '{account.Id}'\");\r\n\r\n    \/\/ get a list of databases in the account\r\n    var databases = await client.ReadDatabaseFeedAsync();\r\n\r\n    \/\/ get a list of offers, each of which represent the throughput of a collection\r\n    var offers = await client.ReadOffersFeedAsync();\r\n\r\n    foreach (var database in databases)\r\n    {\r\n        \/\/ get a list of collections within the database\r\n        var collections = await client.ReadDocumentCollectionFeedAsync(database.CollectionsLink);\r\n\r\n        foreach (var collection in collections)\r\n        {\r\n            log.Verbose($\"Checking collection '{collection.Id}' in database '{database.Id}'\");\r\n            long quota;\r\n\r\n            \/\/ find the quota (throughput) for the collection\r\n            var collectionOffer = offers.SingleOrDefault(o => o.ResourceLink == collection.SelfLink);\r\n            if (collectionOffer is OfferV2)\r\n            {\r\n                quota = ((OfferV2)collectionOffer).Content.OfferThroughput;\r\n            }\r\n            else\r\n            {\r\n                var offer = await client.ReadOfferAsync(collectionOffer.SelfLink);\r\n                quota = offer.CollectionQuota;\r\n            }\r\n            \r\n            \/\/ check the throughput against the policy for the collection\r\n            var alert = CreateAlert(quota, account.Id, database.Id, collection.Id, log);\r\n            if (alert != null)\r\n            {\r\n                alerts.Add(alert);\r\n            }\r\n        }\r\n    }\r\n\r\n    return alerts;\r\n}\r\n\r\nprivate static Alert CreateAlert(long quota, string accountId, string databaseId, string collectionId, TraceWriter log)\r\n{\r\n    var maximumQuota = GetMaximumQuotaForCollection(accountId, databaseId, collectionId);\r\n\r\n    if (quota > maximumQuota)\r\n    {\r\n        log.Info($\"Firing alert for collection '{collectionId}' in database '{databaseId}' in account '{accountId}'. Expected maximum throughput to be {maximumQuota}, actual throughput {quota}.\");\r\n\r\n        return new Alert\r\n        { \r\n            ActualQuota = quota,\r\n            MaximumQuota = maximumQuota,\r\n            AccountId = accountId,\r\n            DatabaseId = databaseId,\r\n            CollectionId = collectionId\r\n        };\r\n    }\r\n\r\n    return null;\r\n}\r\n\r\nprivate static long GetMaximumQuotaForCollection(string accountId, string databaseId, string collectionId)\r\n{\r\n    var settingName = $\"MaximumThroughput:{accountId}:{databaseId}:{collectionId}\";\r\n    var quotaSetting = System.Environment.GetEnvironmentVariable(settingName, EnvironmentVariableTarget.Process);\r\n\r\n    if (quotaSetting != null && long.TryParse(quotaSetting, out var quota))\r\n    {\r\n        return quota;\r\n    }\r\n    else\r\n    {\r\n        return DefaultMaximumQuota;\r\n    }    \r\n}\r\n\r\nclass CosmosDBAccount\r\n{\r\n    public string EndpointUri { get; set; }\r\n    public string ReadOnlyKey { get; set; }\r\n}\r\n\r\nclass Alert\r\n{\r\n    public long ActualQuota { get; set; }\r\n    public long MaximumQuota { get; set; }\r\n    public string AccountId { get; set; }\r\n    public string DatabaseId { get; set; }\r\n    public string CollectionId { get; set; }\r\n\r\n    public override string ToString() => $\"`{CollectionId}` (in `{AccountId}\/{DatabaseId}`) - expected maximum {MaximumQuota} RU\/s, currently {ActualQuota} RU\/s\";\r\n}\r\n",
+                            "project.json": "{\r\n  \"frameworks\": {\r\n    \"net46\":{\r\n      \"dependencies\": {\r\n        \"Microsoft.Azure.DocumentDB\": \"1.22.0\",\r\n        \"Microsoft.Azure.Management.Fluent\": \"1.13.0\",\r\n        \"Microsoft.Azure.WebJobs.Extensions.SendGrid\": \"2.2.0\"\r\n      }\r\n    }\r\n   }\r\n}\r\n"
+                        }
+                    },
+                    "dependsOn": [
+                        "[resourceId('Microsoft.Web/sites', parameters('functionsAppServiceName'))]"
+                    ]
+                }
+            ],
+            "dependsOn": [
+                "[resourceId('Microsoft.Web/serverfarms', variables('functionsAppServicePlanName'))]"
+            ]
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "[parameters('storageAccountName')]",
+            "apiVersion": "2015-06-15",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "accountType": "[parameters('storageAccountType')]"
+            }
+        },
+        {
+            "name": "[variables('applicationInsightsName')]",
+            "type": "Microsoft.Insights/components",
+            "location": "[parameters('applicationInsightsLocation')]",
+            "apiVersion": "2014-04-01",
+            "kind": "other",
+            "properties": {
+                "applicationId": "[variables('applicationInsightsName')]"
+            }
+        }
+    ]
+}
