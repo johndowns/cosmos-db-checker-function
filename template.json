@@ -4,7 +4,7 @@
     "parameters": {
         "functionsAppServiceName": {
             "type": "string",
-            "defaultValue": "[concat('cosmoscheck', uniqueString(resourceGroup().id))]",
+            "defaultValue": "[concat('cosmoscheck', uniqueString(subscription().subscriptionId, resourceGroup().id))]",
             "metadata": {
                 "description": "The name of the Azure Functions application to create. This must be unique."
             }
@@ -18,7 +18,7 @@
         },
         "storageAccountName": {
             "type": "string",
-            "defaultValue": "[concat('cosmoscheck', uniqueString(resourceGroup().id))]",
+            "defaultValue": "[concat('cosmoscheck', uniqueString(subscription().subscriptionId, resourceGroup().id))]",
             "metadata": {
                 "description": "The name of the Azure Storage account to store function logs in."
             }
